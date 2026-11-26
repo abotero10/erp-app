@@ -1,0 +1,64 @@
+# Pipeline de la aplicación (vive en el REPO DE LA APP, en .github/workflows/).
+#   - Pull request a main -> CI: lint + build de la imagen (no publica ni despliega)
+#   - Push/merge a main   -> CI + CD: build, push a Azure Container Registry y
+#                            actualización del Container App
+# Corre en un runner efímero de GitHub, NO en Container Apps.
+# Las variables (vars.*) las crea Terraform en ../bootstrap; no hay secretos:
+# la autenticación con Azure es por OIDC (identidad federada).
+name: ci-cd
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # necesario para el login OIDC con Azure
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ${{ vars.ACR_LOGIN_SERVER }}/odoo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint
+        run: |
+          python3 -m compileall -q addons
+          bash -n entrypoint-erp.sh
+          echo "lint OK"
+
+      - name: Build de la imagen
+        run: |
+          docker build -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" .
+
+      # ---- A partir de aquí solo en push a main (CD) ----
+      - name: Login en Azure (OIDC)
+        if: github.event_name == 'push'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Push a Azure Container Registry
+        if: github.event_name == 'push'
+        run: |
+          az acr login --name "${{ vars.ACR_NAME }}"
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
+
+      - name: Deploy al Container App
+        if: github.event_name == 'push'
+        run: |
+          if az containerapp show -n "${{ vars.CONTAINER_APP_NAME }}" -g "${{ vars.RESOURCE_GROUP }}" >/dev/null 2>&1; then
+            az containerapp update \
+              -n "${{ vars.CONTAINER_APP_NAME }}" \
+              -g "${{ vars.RESOURCE_GROUP }}" \
+              --image "$IMAGE:${{ github.sha }}"
+          else
+            echo "El Container App aún no existe: aplicar primero la infraestructura (terraform apply en infra/)."
+          fi
